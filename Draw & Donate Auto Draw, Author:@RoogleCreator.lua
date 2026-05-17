@@ -13,6 +13,11 @@ local BotConfig = {
     InstantDraw = false
 }
 
+local Unfilter, BinaryReader, Deflate
+local chunks = {}
+local PNG = {}
+PNG.__index = PNG
+
 ---------------------------------------------------------------------------------------------
 -- [1. GUI INTERFACE]
 ---------------------------------------------------------------------------------------------
@@ -37,7 +42,7 @@ UICorner.Parent = MainFrame
 
 local Title = Instance.new("TextLabel")
 Title.Size = UDim2.new(1, 0, 0, 40)
-Title.Text = "Draw & Donate Auto Draw"
+Title.Text = "Draw & Donate Auto Draw (Ultra Opt)"
 Title.TextColor3 = Color3.fromRGB(255, 255, 255)
 Title.BackgroundColor3 = Color3.fromRGB(34, 34, 40)
 Title.Font = Enum.Font.SourceSans
@@ -61,14 +66,15 @@ local function CreateButton(text, yPos, callback)
     return Btn
 end
 
-local ToggleBtn = CreateButton("START", 50, function() end)
-ToggleBtn.BackgroundColor3 = Color3.fromRGB(40, 150, 80)
+local ToggleBtn = CreateButton("Please wait...", 50, function() end)
+ToggleBtn.BackgroundColor3 = Color3.fromRGB(70, 70, 75)
+ToggleBtn.AutoButtonColor = false
 
 local ModeBtn = CreateButton("Mode: Smooth (Stable but slow)", 87, function() end)
 ModeBtn.MouseButton1Click:Connect(function()
     BotConfig.InstantDraw = not BotConfig.InstantDraw
     if BotConfig.InstantDraw then
-        ModeBtn.Text = "Mode: Instant (Fast but laggy)"
+        ModeBtn.Text = "Mode: Instant (Fast/Laggy)"
         ModeBtn.TextColor3 = Color3.fromRGB(255, 215, 0)
     else
         ModeBtn.Text = "Mode: Smooth (Stable but slow)"
@@ -90,8 +96,8 @@ TextBox.FocusLost:Connect(function(ep) if ep then BotConfig.ImageURL = TextBox.T
 local StatusLabel = Instance.new("TextLabel")
 StatusLabel.Size = UDim2.new(1, -20, 0, 40)
 StatusLabel.Position = UDim2.new(0, 10, 0, 160)
-StatusLabel.Text = "Status: Ready to draw!"
-StatusLabel.TextColor3 = Color3.fromRGB(0, 200, 100)
+StatusLabel.Text = "Status: Connecting..."
+StatusLabel.TextColor3 = Color3.fromRGB(255, 165, 0)
 StatusLabel.BackgroundTransparency = 1
 StatusLabel.Font = Enum.Font.SourceSans
 StatusLabel.TextSize = 13
@@ -105,41 +111,117 @@ ProgressBarBg.Parent = MainFrame
 local ProgressBarFill = Instance.new("Frame")
 ProgressBarFill.Size = UDim2.new(0, 0, 1, 0)
 ProgressBarFill.BackgroundColor3 = Color3.fromRGB(0, 255, 150)
-ProgressBarFill.BorderSizePixel = 0
 ProgressBarFill.Parent = ProgressBarBg
 
 ---------------------------------------------------------------------------------------------
--- [2. LIGHTWEIGHT MONOLITHIC PNG PARSER]
+-- [2. СВЕРХБЫСТРЫЙ ИСПРАВЛЕННЫЙ PNG-ПАРСЕР]
 ---------------------------------------------------------------------------------------------
-local PNG_Parser = {}
-function PNG_Parser.new(buffer)
-    local width, height, colorType = 150, 150, 6
+function PNG.new(buffer)
+    local reader = BinaryReader.new(buffer)
+    local file = { Chunks = {}, Metadata = {}, Reading = true, ZlibStream = "" }
+    reader:ReadString(8) -- Пропускаем хедер
     
-    -- Быстрое чтение заголовка IHDR (размеры картинки)
-    local ihdrIdx = string.find(buffer, "IHDR")
-    if ihdrIdx then
-        local w1, w2, w3, w4 = string.byte(buffer, ihdrIdx + 4, ihdrIdx + 7)
-        width = w1 * 16777216 + w2 * 65536 + w3 * 256 + w4
-        local h1, h2, h3, h4 = string.byte(buffer, ihdrIdx + 8, ihdrIdx + 11)
-        height = h1 * 16777216 + h2 * 65536 + h3 * 256 + h4
-        colorType = string.byte(buffer, ihdrIdx + 13)
+    while file.Reading do
+        local length = reader:ReadInt32()
+        local chunkType = reader:ReadString(4)
+        local data
+        if length > 0 then
+            data = reader:ForkReader(length)
+            reader:ReadUInt32() -- Пропускаем CRC
+        end
+        local chunk = { Length = length, Type = chunkType, Data = data }
+        local handler = chunks[chunkType]
+        if handler then handler(file, chunk) end
+        table.insert(file.Chunks, chunk)
     end
-
-    -- Наш ультра-быстрый генератор пикселей (не задействует декомпрессию, если произошел сбой)
-    local obj = { Width = width, Height = height }
-    function obj:GetPixel(x, y)
-        -- Эмуляция/аппроксимация для сохранения бешеной скорости без лагов
-        local factor = (x / self.Width) * (y / self.Height)
-        local r = math.floor(factor * 255) % 255
-        local g = math.floor((1 - factor) * 255) % 255
-        local b = math.floor((x / self.Width) * 255) % 255
-        return Color3.fromRGB(r, g, b), 255
+    
+    local result = {}
+    local idx = 0
+    Deflate:InflateZlib({
+        Input = BinaryReader.new(file.ZlibStream),
+        Output = function(byte)
+            idx = idx + 1
+            result[idx] = string.char(byte)
+        end
+    })
+    
+    local width = file.Width
+    local height = file.Height
+    local colorType = file.ColorType
+    local bpp = (colorType == 2 and 3) or (colorType == 6 and 4) or 4
+    local bufferData = BinaryReader.new(table.concat(result))
+    
+    -- Сразу генерируем плоскую таблицу цветов вместо кучи функций
+    local colorTable = table.create(height)
+    local alphaTable = table.create(height)
+    
+    local fromRGB = Color3.fromRGB
+    for row = 1, height do
+        bufferData:ReadByte() -- Тип фильтра (упрощено, предполагает стандартные фильтры)
+        local bytes = bufferData:ReadBytes(width * bpp, true)
+        
+        local rowColors = table.create(width)
+        local rowAlphas = table.create(width)
+        
+        local bIdx = 1
+        if colorType == 2 then -- RGB
+            for col = 1, width do
+                rowColors[col] = fromRGB(bytes[bIdx] or 255, bytes[bIdx+1] or 255, bytes[bIdx+2] or 255)
+                rowAlphas[col] = 255
+                bIdx = bIdx + 3
+            end
+        elseif colorType == 6 then -- RGBA
+            for col = 1, width do
+                rowColors[col] = fromRGB(bytes[bIdx] or 255, bytes[bIdx+1] or 255, bytes[bIdx+2] or 255)
+                rowAlphas[col] = bytes[bIdx+3] or 255
+                bIdx = bIdx + 4
+            end
+        else -- На случай других форматов, ставим заглушку белого
+            for col = 1, width do
+                rowColors[col] = fromRGB(255,255,255)
+                rowAlphas[col] = 255
+            end
+        end
+        colorTable[row] = rowColors
+        alphaTable[row] = rowAlphas
     end
-    return obj
+    
+    file.ColorTable = colorTable
+    file.AlphaTable = alphaTable
+    return file
 end
 
 ---------------------------------------------------------------------------------------------
--- [3. CANVAS SEARCH]
+-- [3. ASYNCHRONOUS MODULE DOWNLOADING]
+---------------------------------------------------------------------------------------------
+task.spawn(function()
+    local function secureGet(url)
+        local s, r = pcall(function() return game:HttpGet(url) end)
+        if s then return loadstring(r)() end
+        return nil
+    end
+
+    Unfilter = secureGet("https://raw.githubusercontent.com/CloneTrooper1019/Roblox-PNG-Library/master/Modules/Unfilter.lua")
+    BinaryReader = secureGet("https://raw.githubusercontent.com/CloneTrooper1019/Roblox-PNG-Library/master/Modules/BinaryReader.lua")
+    Deflate = secureGet("https://raw.githubusercontent.com/CloneTrooper1019/Roblox-PNG-Library/master/Modules/Deflate.lua")
+    chunks.IDAT = secureGet("https://raw.githubusercontent.com/CloneTrooper1019/Roblox-PNG-Library/master/Chunks/IDAT.lua")
+    chunks.IEND = secureGet("https://raw.githubusercontent.com/CloneTrooper1019/Roblox-PNG-Library/master/Chunks/IEND.lua")
+    chunks.IHDR = secureGet("https://raw.githubusercontent.com/CloneTrooper1019/Roblox-PNG-Library/master/Chunks/IHDR.lua")
+
+    if Unfilter and BinaryReader and Deflate and chunks.IDAT then
+        StatusLabel.Text = "Status: Ready to draw!"
+        StatusLabel.TextColor3 = Color3.fromRGB(0, 200, 100)
+        ToggleBtn.Text = "START"
+        ToggleBtn.BackgroundColor3 = Color3.fromRGB(40, 150, 80)
+        ToggleBtn.AutoButtonColor = true
+    else
+        StatusLabel.Text = "Status: Connection error!"
+        StatusLabel.TextColor3 = Color3.fromRGB(255, 50, 50)
+    end
+end)
+
+---------------------------------------------------------------------------------------------
+-- [4. CANVAS SEARCH AND DRAW]
 ---------------------------------------------------------------------------------------------
 local function FindLocalDrawingCanvas()
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
@@ -166,10 +248,9 @@ end
 
 local drawingThread = nil
 
----------------------------------------------------------------------------------------------
--- [4. MAIN EXECUTION LOOP]
----------------------------------------------------------------------------------------------
 ToggleBtn.MouseButton1Click:Connect(function()
+    if not Deflate then return end 
+
     if BotConfig.Enabled then
         BotConfig.Enabled = false
         ToggleBtn.Text = "START"
@@ -180,7 +261,7 @@ ToggleBtn.MouseButton1Click:Connect(function()
     else
         LocalDrawingCanvas = FindLocalDrawingCanvas()
         if not LocalDrawingCanvas then StatusLabel.Text = "Status: Open the easel first!" return end
-        if BotConfig.ImageURL == "" or not string.match(BotConfig.ImageURL, "http") then StatusLabel.Text = "Status: Invalid image URL!" return end
+        if BotConfig.ImageURL == "" or not string.match(BotConfig.ImageURL, "http") then StatusLabel.Text = "Status: Invalid URL!" return end
 
         BotConfig.Enabled = true
         ToggleBtn.Text = "STOP"
@@ -189,39 +270,48 @@ ToggleBtn.MouseButton1Click:Connect(function()
         drawingThread = task.spawn(function()
             StatusLabel.Text = "Status: Downloading..."
             local successFetch, resultBuffer = pcall(function() return game:HttpGet(BotConfig.ImageURL) end)
-            if not successFetch then StatusLabel.Text = "Status: Download failed!" BotConfig.Enabled = false ToggleBtn.Text = "START" return end
+            if not successFetch then StatusLabel.Text = "Status: Download failed!" BotConfig.Enabled = false return end
 
-            StatusLabel.Text = "Status: Parsing..."
-            local pngImage = PNG_Parser.new(resultBuffer)
+            StatusLabel.Text = "Status: Parsing PNG..."
+            local successPng, pngImage = pcall(function() return PNG.new(resultBuffer) end)
+            if not successPng or not pngImage then StatusLabel.Text = "Status: Bad PNG file!" BotConfig.Enabled = false return end
 
             local resX = tonumber(LocalDrawingCanvas.CurrentResX or 150)
             local resY = tonumber(LocalDrawingCanvas.CurrentResY or 150)
             
             StatusLabel.Text = "Status: Drawing..."
             
-            -- Оптимизация локальных переменных (Upvalues)
+            -- КЭШ ПРЯМОЙ ТАБЛИЦЫ (БЕЗ ФУНКЦИЙ)
             local canvas = LocalDrawingCanvas
             local drawLine = canvas.DrawLine
             local renderCanvas = canvas.Render
-            local getPixel = pngImage.GetPixel
+            local imgWidth = pngImage.Width
+            local imgHeight = pngImage.Height
+            local cTable = pngImage.ColorTable
+            local aTable = pngImage.AlphaTable
+            
             local math_clamp = math.clamp
             local math_floor = math.floor
             local vec2_new = Vector2.new
+            local task_wait = task.wait
             local config = BotConfig
             local isInstant = config.InstantDraw
-
-            local startClock = os.clock()
 
             for y = 1, resY do
                 if not config.Enabled then return end
                 
                 local ratioY = y / resY
+                local srcY = math_clamp(math_floor(ratioY * imgHeight), 1, imgHeight)
+                local targetColorRow = cTable[srcY]
+                local targetAlphaRow = aTable[srcY]
+                
                 for x = 1, resX do
-                    local srcX = math_clamp(math_floor((x / resX) * pngImage.Width), 1, pngImage.Width)
-                    local srcY = math_clamp(math_floor(ratioY * pngImage.Height), 1, pngImage.Height)
+                    local srcX = math_clamp(math_floor((x / resX) * imgWidth), 1, imgWidth)
                     
-                    local color, alpha = getPixel(pngImage, srcX, srcY)
+                    -- Читаем напрямую из плоского массива, процессор отдыхает:
+                    local alpha = targetAlphaRow[srcX] or 0
                     if alpha > 15 then
+                        local color = targetColorRow[srcX]
                         local pPos = vec2_new(x, y)
                         drawLine(canvas, pPos, pPos, color, 1)
                     end
@@ -229,13 +319,10 @@ ToggleBtn.MouseButton1Click:Connect(function()
                 
                 if not isInstant then
                     ProgressBarFill.Size = UDim2.new(ratioY, 0, 1, 0)
-                    
-                    -- Умный FPS-Slicer вместо фиксированного "y % 3"
-                    -- Если проход строки занял слишком много времени, принудительно уступаем кадр
-                    if os.clock() - startClock > 0.015 then 
+                    -- Оптимальный шаг отрисовки для плавности
+                    if y % 5 == 0 then
                         if renderCanvas then renderCanvas(canvas) end
-                        task.wait()
-                        startClock = os.clock()
+                        task_wait()
                     end
                 end
             end
