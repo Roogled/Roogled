@@ -6,7 +6,7 @@ if not pcall(function() return bit32 end) and pcall(function() return bit end) t
 end
 
 -- =======================================================================================
--- [ВШИТЫЕ МОДУЛИ PNG БИБЛИОТЕКИ]
+-- [ПОЛНЫЕ ВШИТЫЕ МОДУЛИ PNG БИБЛИОТЕКИ]
 -- =======================================================================================
 
 -- 1. Модуль BinaryReader
@@ -15,11 +15,7 @@ do
     local reader = {}
     reader.__index = reader
     function reader.new(buffer)
-        local self = setmetatable({}, reader)
-        self.Buffer = buffer
-        self.Length = #buffer
-        self.Index = 1
-        return self
+        return setmetatable({Buffer = buffer, Length = #buffer, Index = 1}, reader)
     end
     function reader:ReadString(len)
         local str = string.sub(self.Buffer, self.Index, self.Index + len - 1)
@@ -32,11 +28,14 @@ do
         return byte
     end
     function reader:ReadBytes(len, asTable)
-        local bytes = {}
-        for i = 1, len do
-            bytes[i] = self:ReadByte()
+        if asTable then
+            local bytes = {}
+            for i = 1, len do bytes[i] = string.byte(self.Buffer, self.Index + i - 1) end
+            self.Index = self.Index + len
+            return bytes
+        else
+            return self:ReadString(len)
         end
-        return asTable and bytes or string.char(unpack(bytes))
     end
     function reader:ReadInt32()
         local b1, b2, b3, b4 = self:ReadByte(), self:ReadByte(), self:ReadByte(), self:ReadByte()
@@ -46,8 +45,7 @@ do
         return self:ReadInt32() % 4294967296
     end
     function reader:ForkReader(len)
-        local subBuffer = self:ReadString(len)
-        return reader.new(subBuffer)
+        return reader.new(self:ReadString(len))
     end
     BinaryReader = reader
 end
@@ -60,66 +58,246 @@ do
     end
     function Unfilter:Sub(scanline, bitmap, bpp, row)
         for i = 1, #scanline do
-            local raw = scanline[i]
             local prior = (i > bpp) and bitmap[row][i - bpp] or 0
-            bitmap[row][i] = (raw + prior) % 256
+            bitmap[row][i] = (scanline[i] + prior) % 256
         end
     end
     function Unfilter:Up(scanline, bitmap, bpp, row)
         for i = 1, #scanline do
-            local raw = scanline[i]
             local prior = (row > 1) and bitmap[row - 1][i] or 0
-            bitmap[row][i] = (raw + prior) % 256
+            bitmap[row][i] = (scanline[i] + prior) % 256
         end
     end
     function Unfilter:Average(scanline, bitmap, bpp, row)
         for i = 1, #scanline do
-            local raw = scanline[i]
             local prior = (i > bpp) and bitmap[row][i - bpp] or 0
             local up = (row > 1) and bitmap[row - 1][i] or 0
-            bitmap[row][i] = (raw + math.floor((prior + up) / 2)) % 256
+            bitmap[row][i] = (scanline[i] + math.floor((prior + up) / 2)) % 256
         end
     end
     function Unfilter:Paeth(scanline, bitmap, bpp, row)
         for i = 1, #scanline do
-            local raw = scanline[i]
             local a = (i > bpp) and bitmap[row][i - bpp] or 0
             local b = (row > 1) and bitmap[row - 1][i] or 0
             local c = (i > bpp and row > 1) and bitmap[row - 1][i - bpp] or 0
             local p = a + b - c
-            local pa = math.abs(p - a)
-            local pb = math.abs(p - b)
-            local pc = math.abs(p - c)
+            local pa, pb, pc = math.abs(p - a), math.abs(p - b), math.abs(p - c)
             local nearest = (pa <= pb and pa <= pc) and a or (pb <= pc and b or c)
-            bitmap[row][i] = (raw + nearest) % 256
+            bitmap[row][i] = (scanline[i] + nearest) % 256
         end
     end
 end
 
--- 3. Модуль Deflate (Облегченный и адаптированный)
+-- 3. ПОЛНЫЙ Модуль Deflate (Оригинальный алгоритм без урезания)
 local Deflate = {}
 do
     local bit32 = getfenv().bit32 or bit
+    local bnot, band, rshift, lshift = bit32.bnot, bit32.band, bit32.rshift, bit32.lshift
+    
+    local function reverseBits(n, bits)
+        local r = 0
+        for i = 1, bits do
+            r = lshift(r, 1) + band(n, 1)
+            n = rshift(n, 1)
+        end
+        return r
+    end
+
+    local function makeHuffmanTable(lengths)
+        local count = #lengths
+        local maxLen = 0
+        for i = 1, count do if lengths[i] > maxLen then maxLen = lengths[i] end end
+        local bl_count = {}
+        for i = 1, maxLen do bl_count[i] = 0 end
+        for i = 1, count do if lengths[i] > 0 then bl_count[lengths[i]] = bl_count[lengths[i]] + 1 end end
+        local code = 0
+        local next_code = {}
+        for bits = 1, maxLen do
+            code = lshift(code + (bl_count[bits - 1] or 0), 1)
+            next_code[bits] = code
+        end
+        local table = {}
+        for i = 1, count do
+            local l = lengths[i]
+            if l > 0 then
+                table[reverseBits(next_code[l], l)] = {l, i - 1}
+                next_code[l] = next_code[l] + 1
+            end
+        end
+        return table, maxLen
+    end
+
+    local function decodeSymbol(reader, bitBuffer, bitCount, huffTable, maxLen)
+        while bitCount < maxLen do
+            local byte = reader:ReadByte()
+            if not byte then break end
+            bitBuffer = bitBuffer + lshift(byte, bitCount)
+            bitCount = bitCount + 8
+        end
+        for bits = 1, maxLen do
+            local code = band(bitBuffer, lshift(1, bits) - 1)
+            local res = huffTable[code]
+            if res and res[1] == bits then
+                return res[2], bitBuffer / lshift(1, bits), bitCount - bits
+            end
+        end
+        return nil, bitBuffer, bitCount
+    end
+
     function Deflate:InflateZlib(config)
-        local input = config.Input
+        local reader = config.Input
         local output = config.Output
         
-        -- Пропускаем zlib заголовок
-        local cmf = input:ReadByte()
-        local flg = input:ReadByte()
+        local cmf = reader:ReadByte()
+        local flg = reader:ReadByte()
+        if (cmf * 256 + flg) % 31 ~= 0 then error("Zlib - Invalid checksum", 2) end
+        if band(flg, 32) ~= 0 then error("Zlib - Preset dictionaries not supported", 2) end
         
-        -- Базовый алгоритм распаковки IDAT стрима
-        local buffer = input.Buffer
-        local index = input.Index
-        local len = #buffer - 4 -- отсекаем чексумму
+        local bitBuffer, bitCount = 0, 0
+        local isLast = 0
         
-        for i = index, len do
-            output(string.byte(buffer, i))
+        local lengthBases = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258}
+        local lengthExtra = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0}
+        local distBases = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577}
+        local distExtra = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13}
+        local clOrder = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15}
+
+        local fixedLitTable, fixedLitMax
+        do
+            local lens = {}
+            for i = 1, 144 do lens[i] = 8 end
+            for i = 145, 256 do lens[i] = 9 end
+            for i = 257, 280 do lens[i] = 7 end
+            for i = 281, 288 do lens[i] = 8 end
+            fixedLitTable, fixedLitMax = makeHuffmanTable(lens)
+        end
+        local fixedDistTable, fixedDistMax = makeHuffmanTable({5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5})
+
+        local history = {}
+        local historyIndex = 1
+
+        while isLast == 0 do
+            while bitCount < 3 do
+                local byte = reader:ReadByte()
+                if not byte then break end
+                bitBuffer = bitBuffer + lshift(byte, bitCount)
+                bitCount = bitCount + 8
+            end
+            isLast = band(bitBuffer, 1)
+            local blockType = band(rshift(bitBuffer, 1), 3)
+            bitBuffer = rshift(bitBuffer, 3)
+            bitCount = bitCount - 3
+            
+            if blockType == 0 then -- Uncompressed
+                bitBuffer, bitCount = 0, 0
+                local len = reader:ReadByte() + reader:ReadByte() * 256
+                local nlen = reader:ReadByte() + reader:ReadByte() * 256
+                for i = 1, len do
+                    local byte = reader:ReadByte()
+                    output(byte)
+                    history[historyIndex] = byte
+                    historyIndex = (historyIndex % 32768) + 1
+                end
+            elseif blockType == 1 or blockType == 2 then -- Huffman
+                local litTable, litMax, distTable, distMax
+                if blockType == 1 then
+                    litTable, litMax, distTable, distMax = fixedLitTable, fixedLitMax, fixedDistTable, fixedDistMax
+                else
+                    while bitCount < 14 do
+                        bitBuffer = bitBuffer + lshift(reader:ReadByte(), bitCount)
+                        bitCount = bitCount + 8
+                    end
+                    local hlit = band(bitBuffer, 31) + 257
+                    local hdist = band(rshift(bitBuffer, 5), 31) + 1
+                    local hclen = band(rshift(bitBuffer, 10), 15) + 4
+                    bitBuffer = rshift(bitBuffer, 14)
+                    bitCount = bitCount - 14
+                    
+                    local clLens = {}
+                    for i = 1, 19 do clLens[i] = 0 end
+                    for i = 1, hclen do
+                        while bitCount < 3 do bitBuffer = bitBuffer + lshift(reader:ReadByte(), bitCount) bitCount = bitCount + 8 end
+                        clLens[clOrder[i] + 1] = band(bitBuffer, 7)
+                        bitBuffer = rshift(bitBuffer, 3)
+                        bitCount = bitCount - 3
+                    end
+                    local clTable, clMax = makeHuffmanTable(clLens)
+                    
+                    local allLens = {}
+                    local target = hlit + hdist
+                    while #allLens < target do
+                        local sym
+                        sym, bitBuffer, bitCount = decodeSymbol(reader, bitBuffer, bitCount, clTable, clMax)
+                        if sym < 16 then
+                            table.insert(allLens, sym)
+                        local rep = 0, last = 0
+                        elseif sym == 16 then
+                            while bitCount < 2 do bitBuffer = bitBuffer + lshift(reader:ReadByte(), bitCount) bitCount = bitCount + 8 end
+                            rep = band(bitBuffer, 3) + 3 bitBuffer = rshift(bitBuffer, 2) bitCount = bitCount - 2
+                            last = allLens[#allLens]
+                            for i = 1, rep do table.insert(allLens, last) end
+                        elseif sym == 17 then
+                            while bitCount < 3 do bitBuffer = bitBuffer + lshift(reader:ReadByte(), bitCount) bitCount = bitCount + 8 end
+                            rep = band(bitBuffer, 7) + 3 bitBuffer = rshift(bitBuffer, 3) bitCount = bitCount - 3
+                            for i = 1, rep do table.insert(allLens, 0) end
+                        elseif sym == 18 then
+                            while bitCount < 7 do bitBuffer = bitBuffer + lshift(reader:ReadByte(), bitCount) bitCount = bitCount + 8 end
+                            rep = band(bitBuffer, 127) + 11 bitBuffer = rshift(bitBuffer, 7) bitCount = bitCount - 7
+                            for i = 1, rep do table.insert(allLens, 0) end
+                        end
+                    end
+                    local litLens = {}
+                    for i = 1, hlit do litLens[i] = allLens[i] end
+                    local distLens = {}
+                    for i = hlit + 1, #allLens do table.insert(distLens, allLens[i]) end
+                    litTable, litMax = makeHuffmanTable(litLens)
+                    distTable, distMax = makeHuffmanTable(distLens)
+                end
+                
+                while true do
+                    local sym
+                    sym, bitBuffer, bitCount = decodeSymbol(reader, bitBuffer, bitCount, litTable, litMax)
+                    if sym < 256 then
+                        output(sym)
+                        history[historyIndex] = sym
+                        historyIndex = (historyIndex % 32768) + 1
+                    elseif sym == 256 then
+                        break
+                    else
+                        local lenIdx = sym - 256
+                        local len = lengthBases[lenIdx]
+                        local extraL = lengthExtra[lenIdx]
+                        if extraL > 0 then
+                            while bitCount < extraL do bitBuffer = bitBuffer + lshift(reader:ReadByte(), bitCount) bitCount = bitCount + 8 end
+                            len = len + band(bitBuffer, lshift(1, extraL) - 1)
+                            bitBuffer = rshift(bitBuffer, extraL)
+                            bitCount = bitCount - extraL
+                        end
+                        local distSym
+                        distSym, bitBuffer, bitCount = decodeSymbol(reader, bitBuffer, bitCount, distTable, distMax)
+                        local dist = distBases[distSym + 1]
+                        local extraD = distExtra[distSym + 1]
+                        if extraD > 0 then
+                            while bitCount < extraD do bitBuffer = bitBuffer + lshift(reader:ReadByte(), bitCount) bitCount = bitCount + 8 end
+                            dist = dist + band(bitBuffer, lshift(1, extraD) - 1)
+                            bitBuffer = rshift(bitBuffer, extraD)
+                            bitCount = bitCount - extraD
+                        end
+                        for i = 1, len do
+                            local lookBack = (historyIndex - 1 - dist) % 32768 + 1
+                            local byte = history[lookBack] or 0
+                            output(byte)
+                            history[historyIndex] = byte
+                            historyIndex = (historyIndex % 32768) + 1
+                        end
+                    end
+                end
+            end
         end
     end
 end
 
--- 4. Обработчики Чанков (Chunks handlers)
+-- 4. Обработчики Чанков
 local chunks = {}
 chunks.IHDR = function(file, chunk)
     local reader = chunk.Data
@@ -134,9 +312,7 @@ end
 chunks.IDAT = function(file, chunk)
     file.ZlibStream = file.ZlibStream .. chunk.Data.Buffer
 end
-chunks.IEND = function(file, chunk)
-    file.Reading = false
-end
+chunks.IEND = function(file, chunk) file.Reading = false end
 chunks.PLTE = function(file, chunk)
     local reader = chunk.Data
     local palette = {}
@@ -151,11 +327,8 @@ chunks.tRNS = function(file, chunk)
     for i = 1, chunk.Length do table.insert(alpha, reader:ReadByte()) end
     file.AlphaData = alpha
 end
-
--- Заглушки для необязательных метаданных, чтобы не вылетало ошибок
 chunks.bKGD = function() end chunks.cHRM = function() end chunks.gAMA = function() end
 chunks.sRGB = function() end chunks.tEXt = function() end chunks.tIME = function() end
-
 
 -- =======================================================================================
 -- [ОСНОВНАЯ PNG ЛОГИКА]
@@ -172,26 +345,30 @@ local function getBytesPerPixel(colorType)
 end
 
 function PNG:GetPixel(x, y)
-    local width, height = self.Width, self.Height
-    x = math.clamp(math.floor(tonumber(x) or 0 + 0.5), 1, width)
-    y = math.clamp(math.floor(tonumber(y) or 0 + 0.5), 1, height)
-    
+    x = math.clamp(math.floor(x), 1, self.Width)
+    y = math.clamp(math.floor(y), 1, self.Height)
     local row = self.Bitmap[y]
     if not row then return Color3.new(1,1,1), 0 end
     
     local bpp = self.BytesPerPixel
     local i0 = ((x - 1) * bpp) + 1
-    
     local colorType = self.ColorType
-    if colorType == 2 then -- RGB
+    
+    if colorType == 2 then
         return Color3.fromRGB(row[i0] or 0, row[i0+1] or 0, row[i0+2] or 0), 255
-    elseif colorType == 6 then -- RGBA
+    elseif colorType == 6 then
         return Color3.fromRGB(row[i0] or 0, row[i0+1] or 0, row[i0+2] or 0), row[i0+3] or 255
-    elseif colorType == 3 then -- Palette
+    elseif colorType == 3 then
         local idx = (row[i0] or 0) + 1
         local color = self.Palette and self.Palette[idx] or Color3.new(1,1,1)
         local alpha = self.AlphaData and self.AlphaData[idx] or 255
         return color, alpha
+    elseif colorType == 0 then
+        local g = (row[i0] or 0) / 255
+        return Color3.new(g, g, g), 255
+    elseif colorType == 4 then
+        local g = (row[i0] or 0) / 255
+        return Color3.new(g, g, g), row[i0+1] or 255
     end
     return Color3.new(1,1,1), 255
 end
@@ -200,15 +377,13 @@ function PNG.new(buffer)
     local reader = BinaryReader.new(buffer)
     local file = { Chunks = {}, Metadata = {}, Reading = true, ZlibStream = "" }
     
-    local header = reader:ReadString(8)
-    if header ~= "\137PNG\r\n\26\n" then error("PNG - Invalid header", 2) end
+    if reader:ReadString(8) ~= "\137PNG\r\n\26\n" then error("PNG - Invalid header", 2) end
     
     while file.Reading do
         local length = reader:ReadInt32()
         local chunkType = reader:ReadString(4)
         local data = reader:ForkReader(length)
-        if length > 0 then reader:ReadUInt32() end -- CRC
-        
+        if length > 0 then reader:ReadUInt32() end
         local chunk = { Length = length, Type = chunkType, Data = data }
         local handler = chunks[chunkType]
         if handler then handler(file, chunk) end
@@ -222,7 +397,7 @@ function PNG.new(buffer)
     
     local response = table.concat(decompressed)
     local width, height = file.Width, file.Height
-    local buffer = BinaryReader.new(response)
+    local bBuffer = BinaryReader.new(response)
     file.ZlibStream = nil
     
     local bitmap = {}
@@ -231,8 +406,8 @@ function PNG.new(buffer)
     file.BytesPerPixel = bpp
     
     for row = 1, height do
-        local filterType = buffer:ReadByte()
-        local scanline = buffer:ReadBytes(width * bpp, true)
+        local filterType = bBuffer:ReadByte()
+        local scanline = bBuffer:ReadBytes(width * bpp, true)
         bitmap[row] = {}
         
         if filterType == 0 then Unfilter:None(scanline, bitmap, bpp, row)
@@ -243,7 +418,6 @@ function PNG.new(buffer)
     end
     return setmetatable(file, PNG)
 end
-
 
 -- =======================================================================================
 -- [ИНТЕРФЕЙС И ЛОГИКА РИСОВАНИЯ]
@@ -303,7 +477,6 @@ local ToggleBtn = CreateButton("START", 50)
 ToggleBtn.BackgroundColor3 = Color3.fromRGB(40, 150, 80)
 
 local ModeBtn = CreateButton("Mode: Smooth (Stable but slow)", 87)
-
 ModeBtn.MouseButton1Click:Connect(function()
     BotConfig.InstantDraw = not BotConfig.InstantDraw
     if BotConfig.InstantDraw then
