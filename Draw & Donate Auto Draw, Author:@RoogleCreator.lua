@@ -9,9 +9,18 @@ local BotConfig = {
     InstantDraw = false
 }
 
---------------------------------------------------------------------
--- 1. СВЕРХЛЁГКИЙ БИНАРНЫЙ РИДЕР (без внешних библиотек)
---------------------------------------------------------------------
+-- -----------------------------------------------------------------
+-- 1. БИТОВЫЕ ОПЕРАЦИИ через bit32 (Roblox)
+-- -----------------------------------------------------------------
+local band = bit32.band
+local bor = bit32.bor
+local bxor = bit32.bxor
+local lshift = bit32.lshift
+local rshift = bit32.rshift
+
+-- -----------------------------------------------------------------
+-- 2. БИНАРНЫЙ РИДЕР (без внешних библиотек)
+-- -----------------------------------------------------------------
 local BinaryReader = {}
 BinaryReader.__index = BinaryReader
 
@@ -54,7 +63,7 @@ function BinaryReader:ReadUInt32()
     local b2 = self:ReadByte()
     local b3 = self:ReadByte()
     local b4 = self:ReadByte()
-    return (b1 << 24) | (b2 << 16) | (b3 << 8) | b4
+    return lshift(b1, 24) + lshift(b2, 16) + lshift(b3, 8) + b4
 end
 
 function BinaryReader:ReadInt32()
@@ -70,9 +79,9 @@ function BinaryReader:ForkReader(length)
     return BinaryReader.new(sub)
 end
 
---------------------------------------------------------------------
--- 2. INFLATE (Zlib) – чистая реализация на Lua
---------------------------------------------------------------------
+-- -----------------------------------------------------------------
+-- 3. INFLATE (Zlib) – реализация на Lua с bit32
+-- -----------------------------------------------------------------
 local Inflate = {}
 
 local function buildFixedTables()
@@ -105,7 +114,7 @@ local function buildHuffmanTree(codes)
     local nextCode = {}
     local code = 0
     for bits = 1, maxBits do
-        code = (code + (blCount[bits-1] or 0)) << 1
+        code = lshift((code + (blCount[bits-1] or 0)), 1)
         nextCode[bits] = code
     end
     local tree = {}
@@ -124,12 +133,14 @@ local function readBits(reader, n)
     while reader.bitCount < n do
         local byte = reader:ReadByte()
         if byte == nil then error("EOF") end
-        reader.bitBuffer = reader.bitBuffer | (byte << reader.bitCount)
+        reader.bitBuffer = bor(reader.bitBuffer, lshift(byte, reader.bitCount))
         reader.bitCount = reader.bitCount + 8
     end
-    local mask = (1 << n) - 1
-    local val = reader.bitBuffer & mask
-    reader.bitBuffer = reader.bitBuffer >> n
+    local mask = (1 << n) - 1   -- здесь << допустим только в математическом смысле, но в Lua 5.1 нет. Заменим:
+    -- В Lua 5.1 нет оператора <<, но для маски можно вычислить через 2^n
+    mask = 2^n - 1
+    local val = band(reader.bitBuffer, mask)
+    reader.bitBuffer = rshift(reader.bitBuffer, n)
     reader.bitCount = reader.bitCount - n
     return val
 end
@@ -137,7 +148,8 @@ end
 local function decodeSymbol(reader, tree, maxBits)
     local code = 0
     for len = 1, maxBits do
-        code = code | (readBits(reader, 1) << (len-1))
+        local bit = readBits(reader, 1)
+        code = bor(code, lshift(bit, len-1))
         local sym = tree[code]
         if sym ~= nil then return sym end
     end
@@ -152,7 +164,6 @@ local function inflateBlock(reader, outputFunc)
         readBits(reader, (4 - reader.bitCount) % 4)
         local len = reader:ReadUInt32()
         local nlen = reader:ReadUInt32()
-        if (len ~= (0xFFFF - nlen)) then end
         for i = 1, len do
             local byte = reader:ReadByte()
             outputFunc(byte)
@@ -241,7 +252,7 @@ function Inflate.InflateZlib(reader, outputFunc)
     local cmf = reader:ReadByte()
     local flg = reader:ReadByte()
     if (cmf * 256 + flg) % 31 ~= 0 then error("Bad Zlib header") end
-    if (cmf & 0x0F) ~= 8 then error("Only deflate supported") end
+    if band(cmf, 0x0F) ~= 8 then error("Only deflate supported") end
     outputFunc.buffer = {}
     local function wrappedOut(byte)
         outputFunc.buffer[#outputFunc.buffer+1] = byte
@@ -251,15 +262,15 @@ function Inflate.InflateZlib(reader, outputFunc)
     while not done do
         done = inflateBlock(reader, wrappedOut)
     end
-    local adler = reader:ReadUInt32() -- skip adler
+    local adler = reader:ReadUInt32() -- skip
     local result = table.concat(outputFunc.buffer)
     outputFunc.buffer = nil
     return result
 end
 
---------------------------------------------------------------------
--- 3. ФИЛЬТРЫ PNG (собственная реализация)
---------------------------------------------------------------------
+-- -----------------------------------------------------------------
+-- 4. ФИЛЬТРЫ PNG
+-- -----------------------------------------------------------------
 local Unfilter = {}
 
 function Unfilter:None(scanline, bitmap, bpp, row)
@@ -271,7 +282,7 @@ end
 function Unfilter:Sub(scanline, bitmap, bpp, row)
     for i = 1, #scanline do
         local left = (i > bpp) and bitmap[row][i - bpp] or 0
-        bitmap[row][i] = (scanline[i] + left) & 0xFF
+        bitmap[row][i] = band(scanline[i] + left, 0xFF)
     end
 end
 
@@ -279,7 +290,7 @@ function Unfilter:Up(scanline, bitmap, bpp, row)
     local prevRow = bitmap[row-1] or {}
     for i = 1, #scanline do
         local above = prevRow[i] or 0
-        bitmap[row][i] = (scanline[i] + above) & 0xFF
+        bitmap[row][i] = band(scanline[i] + above, 0xFF)
     end
 end
 
@@ -288,7 +299,7 @@ function Unfilter:Average(scanline, bitmap, bpp, row)
     for i = 1, #scanline do
         local left = (i > bpp) and bitmap[row][i - bpp] or 0
         local above = prevRow[i] or 0
-        bitmap[row][i] = (scanline[i] + math.floor((left + above) / 2)) & 0xFF
+        bitmap[row][i] = band(scanline[i] + math.floor((left + above) / 2), 0xFF)
     end
 end
 
@@ -306,13 +317,13 @@ function Unfilter:Paeth(scanline, bitmap, bpp, row)
         if pa <= pb and pa <= pc then predictor = left
         elseif pb <= pc then predictor = above
         else predictor = upperLeft end
-        bitmap[row][i] = (scanline[i] + predictor) & 0xFF
+        bitmap[row][i] = band(scanline[i] + predictor, 0xFF)
     end
 end
 
---------------------------------------------------------------------
--- 4. ОСНОВНОЙ ПАРСЕР PNG
---------------------------------------------------------------------
+-- -----------------------------------------------------------------
+-- 5. ПАРСЕР PNG
+-- -----------------------------------------------------------------
 local function getBytesPerPixel(colorType)
     if colorType == 0 or colorType == 3 then return 1 end
     if colorType == 4 then return 2 end
@@ -339,7 +350,7 @@ function PNG.new(buffer)
         local chunkType = reader:ReadString(4)
         local data = nil
         if length > 0 then data = reader:ForkReader(length) end
-        local crc = reader:ReadUInt32() -- not used, trust the data
+        local crc = reader:ReadUInt32()
 
         if chunkType == "IHDR" then
             file.Width = data:ReadInt32()
@@ -437,126 +448,140 @@ function PNG:GetPixel(x, y)
     return Color3.new(1,1,1), 255
 end
 
---------------------------------------------------------------------
--- 5. GUI (без изменений, только подключаем локальный парсер)
---------------------------------------------------------------------
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "DrawAndDonateAutoDraw"
-ScreenGui.ResetOnSpawn = false
-pcall(function() ScreenGui.Parent = CoreGui end)
-if not ScreenGui.Parent then ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+-- -----------------------------------------------------------------
+-- 6. GUI (с надежным ожиданием PlayerGui)
+-- -----------------------------------------------------------------
+local function CreateGUI()
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "DrawAndDonateAutoDraw"
+    screenGui.ResetOnSpawn = false
 
-local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 250, 0, 260)
-MainFrame.Position = UDim2.new(0.05, 0, 0.3, 0)
-MainFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 28)
-MainFrame.BorderSizePixel = 0
-MainFrame.Active = true
-MainFrame.Draggable = true
-MainFrame.Parent = ScreenGui
+    -- Пытаемся вставить в CoreGui, если не получается – в PlayerGui
+    local success, err = pcall(function()
+        screenGui.Parent = CoreGui
+    end)
+    if not success then
+        local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+        screenGui.Parent = playerGui
+    end
 
-local UICorner = Instance.new("UICorner")
-UICorner.CornerRadius = UDim.new(0, 2)
-UICorner.Parent = MainFrame
+    local MainFrame = Instance.new("Frame")
+    MainFrame.Size = UDim2.new(0, 250, 0, 260)
+    MainFrame.Position = UDim2.new(0.05, 0, 0.3, 0)
+    MainFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 28)
+    MainFrame.BorderSizePixel = 0
+    MainFrame.Active = true
+    MainFrame.Draggable = true
+    MainFrame.Parent = screenGui
 
-local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(1, 0, 0, 40)
-Title.Text = "Draw & Donate Auto Draw"
-Title.TextColor3 = Color3.fromRGB(255, 255, 255)
-Title.BackgroundColor3 = Color3.fromRGB(34, 34, 40)
-Title.Font = Enum.Font.SourceSans
-Title.TextSize = 14
-Title.Parent = MainFrame
+    local UICorner = Instance.new("UICorner")
+    UICorner.CornerRadius = UDim.new(0, 2)
+    UICorner.Parent = MainFrame
 
-local UTCorner = Instance.new("UICorner")
-UTCorner.CornerRadius = UDim.new(0, 2)
-UTCorner.Parent = Title
+    local Title = Instance.new("TextLabel")
+    Title.Size = UDim2.new(1, 0, 0, 40)
+    Title.Text = "Draw & Donate Auto Draw"
+    Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Title.BackgroundColor3 = Color3.fromRGB(34, 34, 40)
+    Title.Font = Enum.Font.SourceSans
+    Title.TextSize = 14
+    Title.Parent = MainFrame
 
-local function CreateButton(text, yPos, callback)
-    local Btn = Instance.new("TextButton")
-    Btn.Size = UDim2.new(1, -20, 0, 32)
-    Btn.Position = UDim2.new(0, 10, 0, yPos)
-    Btn.Text = text
-    Btn.TextColor3 = Color3.fromRGB(240, 240, 240)
-    Btn.BackgroundColor3 = Color3.fromRGB(44, 44, 52)
-    Btn.Font = Enum.Font.SourceSans
-    Btn.TextSize = 14
-    Btn.Parent = MainFrame
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, 2)
-    c.Parent = Btn
-    Btn.MouseButton1Click:Connect(callback)
-    return Btn
+    local UTCorner = Instance.new("UICorner")
+    UTCorner.CornerRadius = UDim.new(0, 2)
+    UTCorner.Parent = Title
+
+    local function CreateButton(text, yPos, callback)
+        local Btn = Instance.new("TextButton")
+        Btn.Size = UDim2.new(1, -20, 0, 32)
+        Btn.Position = UDim2.new(0, 10, 0, yPos)
+        Btn.Text = text
+        Btn.TextColor3 = Color3.fromRGB(240, 240, 240)
+        Btn.BackgroundColor3 = Color3.fromRGB(44, 44, 52)
+        Btn.Font = Enum.Font.SourceSans
+        Btn.TextSize = 14
+        Btn.Parent = MainFrame
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 2)
+        c.Parent = Btn
+        Btn.MouseButton1Click:Connect(callback)
+        return Btn
+    end
+
+    local ToggleBtn = CreateButton("START", 50, function() end)
+    ToggleBtn.BackgroundColor3 = Color3.fromRGB(40, 150, 80)
+    ToggleBtn.AutoButtonColor = true
+
+    local ModeBtn = CreateButton("Mode: Smooth (Stable but slow)", 87, function() end)
+    ModeBtn.MouseButton1Click:Connect(function()
+        BotConfig.InstantDraw = not BotConfig.InstantDraw
+        if BotConfig.InstantDraw then
+            ModeBtn.Text = "Mode: Instant (Might lag a bit)"
+            ModeBtn.TextColor3 = Color3.fromRGB(255, 215, 0)
+        else
+            ModeBtn.Text = "Mode: Smooth (Stable but slow)"
+            ModeBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
+        end
+    end)
+
+    local TextBox = Instance.new("TextBox")
+    TextBox.Size = UDim2.new(1, -20, 0, 30)
+    TextBox.Position = UDim2.new(0, 10, 0, 125)
+    TextBox.Text = "Insert direct .png URL link"
+    TextBox.TextColor3 = Color3.fromRGB(200, 200, 200)
+    TextBox.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+    TextBox.Font = Enum.Font.SourceSans
+    TextBox.TextSize = 12
+    TextBox.TextWrapped = true
+    TextBox.ClearTextOnFocus = false
+    TextBox.Parent = MainFrame
+    local BoxCorner = Instance.new("UICorner")
+    BoxCorner.CornerRadius = UDim.new(0, 2)
+    BoxCorner.Parent = TextBox
+    TextBox.FocusLost:Connect(function(ep) if ep then BotConfig.ImageURL = TextBox.Text end end)
+
+    local StatusLabel = Instance.new("TextLabel")
+    StatusLabel.Size = UDim2.new(1, -20, 0, 40)
+    StatusLabel.Position = UDim2.new(0, 10, 0, 160)
+    StatusLabel.Text = "Status: Ready (No external libs)"
+    StatusLabel.TextColor3 = Color3.fromRGB(0, 200, 100)
+    StatusLabel.BackgroundTransparency = 1
+    StatusLabel.Font = Enum.Font.SourceSans
+    StatusLabel.TextSize = 13
+    StatusLabel.TextWrapped = true
+    StatusLabel.Parent = MainFrame
+
+    local AuthorLabel = Instance.new("TextLabel")
+    AuthorLabel.Size = UDim2.new(1, -20, 0, 20)
+    AuthorLabel.Position = UDim2.new(0, 10, 0, 205)
+    AuthorLabel.Text = "Author: @RoogleCreator"
+    AuthorLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+    AuthorLabel.BackgroundTransparency = 1
+    AuthorLabel.Font = Enum.Font.SourceSans
+    AuthorLabel.TextSize = 12
+    AuthorLabel.Parent = MainFrame
+
+    local ProgressBarBg = Instance.new("Frame")
+    ProgressBarBg.Size = UDim2.new(1, -20, 0, 6)
+    ProgressBarBg.Position = UDim2.new(0, 10, 0, 235)
+    ProgressBarBg.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    ProgressBarBg.BorderSizePixel = 0
+    ProgressBarBg.Parent = MainFrame
+    local ProgressBarFill = Instance.new("Frame")
+    ProgressBarFill.Size = UDim2.new(0, 0, 1, 0)
+    ProgressBarFill.BackgroundColor3 = Color3.fromRGB(0, 255, 150)
+    ProgressBarFill.BorderSizePixel = 0
+    ProgressBarFill.Parent = ProgressBarBg
+
+    return ToggleBtn, ModeBtn, StatusLabel, ProgressBarFill
 end
 
-local ToggleBtn = CreateButton("START", 50, function() end)
-ToggleBtn.BackgroundColor3 = Color3.fromRGB(40, 150, 80)
-ToggleBtn.AutoButtonColor = true
+-- Создаём GUI и получаем ссылки на элементы управления
+local ToggleBtn, ModeBtn, StatusLabel, ProgressBarFill = CreateGUI()
 
-local ModeBtn = CreateButton("Mode: Smooth (Stable but slow)", 87, function() end)
-ModeBtn.MouseButton1Click:Connect(function()
-    BotConfig.InstantDraw = not BotConfig.InstantDraw
-    if BotConfig.InstantDraw then
-        ModeBtn.Text = "Mode: Instant (Might lag a bit)"
-        ModeBtn.TextColor3 = Color3.fromRGB(255, 215, 0)
-    else
-        ModeBtn.Text = "Mode: Smooth (Stable but slow)"
-        ModeBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
-    end
-end)
-
-local TextBox = Instance.new("TextBox")
-TextBox.Size = UDim2.new(1, -20, 0, 30)
-TextBox.Position = UDim2.new(0, 10, 0, 125)
-TextBox.Text = "Insert direct .png URL link"
-TextBox.TextColor3 = Color3.fromRGB(200, 200, 200)
-TextBox.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
-TextBox.Font = Enum.Font.SourceSans
-TextBox.TextSize = 12
-TextBox.TextWrapped = true
-TextBox.ClearTextOnFocus = false
-TextBox.Parent = MainFrame
-local BoxCorner = Instance.new("UICorner")
-BoxCorner.CornerRadius = UDim.new(0, 2)
-BoxCorner.Parent = TextBox
-TextBox.FocusLost:Connect(function(ep) if ep then BotConfig.ImageURL = TextBox.Text end end)
-
-local StatusLabel = Instance.new("TextLabel")
-StatusLabel.Size = UDim2.new(1, -20, 0, 40)
-StatusLabel.Position = UDim2.new(0, 10, 0, 160)
-StatusLabel.Text = "Status: Ready"
-StatusLabel.TextColor3 = Color3.fromRGB(0, 200, 100)
-StatusLabel.BackgroundTransparency = 1
-StatusLabel.Font = Enum.Font.SourceSans
-StatusLabel.TextSize = 13
-StatusLabel.TextWrapped = true
-StatusLabel.Parent = MainFrame
-
-local AuthorLabel = Instance.new("TextLabel")
-AuthorLabel.Size = UDim2.new(1, -20, 0, 20)
-AuthorLabel.Position = UDim2.new(0, 10, 0, 205)
-AuthorLabel.Text = "Author: @RoogleCreator"
-AuthorLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
-AuthorLabel.BackgroundTransparency = 1
-AuthorLabel.Font = Enum.Font.SourceSans
-AuthorLabel.TextSize = 12
-AuthorLabel.Parent = MainFrame
-
-local ProgressBarBg = Instance.new("Frame")
-ProgressBarBg.Size = UDim2.new(1, -20, 0, 6)
-ProgressBarBg.Position = UDim2.new(0, 10, 0, 235)
-ProgressBarBg.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
-ProgressBarBg.BorderSizePixel = 0
-ProgressBarBg.Parent = MainFrame
-local ProgressBarFill = Instance.new("Frame")
-ProgressBarFill.Size = UDim2.new(0, 0, 1, 0)
-ProgressBarFill.BackgroundColor3 = Color3.fromRGB(0, 255, 150)
-ProgressBarFill.BorderSizePixel = 0
-ProgressBarFill.Parent = ProgressBarBg
-
---------------------------------------------------------------------
--- 6. ПОИСК CANVAS И ОСНОВНОЙ ЦИКЛ РИСОВАНИЯ
---------------------------------------------------------------------
+-- -----------------------------------------------------------------
+-- 7. ПОИСК CANVAS И ОСНОВНОЙ ЦИКЛ
+-- -----------------------------------------------------------------
 local function FindLocalDrawingCanvas()
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not playerGui then return nil end
@@ -591,8 +616,14 @@ ToggleBtn.MouseButton1Click:Connect(function()
         ProgressBarFill.Size = UDim2.new(0, 0, 1, 0)
     else
         LocalDrawingCanvas = FindLocalDrawingCanvas()
-        if not LocalDrawingCanvas then StatusLabel.Text = "Status: Open the easel first!" return end
-        if BotConfig.ImageURL == "" or not string.match(BotConfig.ImageURL, "http") then StatusLabel.Text = "Status: Invalid image URL!" return end
+        if not LocalDrawingCanvas then
+            StatusLabel.Text = "Status: Open the easel first!"
+            return
+        end
+        if BotConfig.ImageURL == "" or not string.match(BotConfig.ImageURL, "http") then
+            StatusLabel.Text = "Status: Invalid image URL!"
+            return
+        end
 
         BotConfig.Enabled = true
         ToggleBtn.Text = "STOP"
@@ -651,5 +682,3 @@ ToggleBtn.MouseButton1Click:Connect(function()
         end)
     end
 end)
-
-StatusLabel.Text = "Status: Ready (No external libs)"
